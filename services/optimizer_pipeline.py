@@ -187,11 +187,24 @@ def _optimize_pass(
     # ── Genetic Algorithm: joint package→vehicle assignment ───────────────────
     # We run GA on the full package set (not per-cluster) for true joint
     # optimization.  Clusters are used only to build a smarter greedy seed.
-    assignments: list[AssignmentResult] = run_genetic_assignment(
+    #
+    # is_deliverer: enforces the ≤15 packages/vehicle hard constraint and
+    # uses the correct penalty scale inside the fitness function.
+    is_deliverer = (route_type == "local_delivery")
+    assignments, sorted_ga_vehicles = run_genetic_assignment(
         packages=ga_packages,
         vehicles=ga_vehicles,
         origin_coords=origin,
+        is_deliverer=is_deliverer,
     )
+
+    # Build a lookup from GA vehicle index → original VehicleInput.
+    # The GA returns assignments using sorted_ga_vehicles indices (small→large),
+    # so we map sorted_ga_vehicles[i].idx → vehicles[original_idx].
+    ga_veh_idx_to_input: dict[int, VehicleInput] = {
+        i: vehicles[sv.idx]
+        for i, sv in enumerate(sorted_ga_vehicles)
+    }
 
     # ── Build routes per vehicle ──────────────────────────────────────────────
     routes:      list[RouteOutput]      = []
@@ -199,7 +212,6 @@ def _optimize_pass(
 
     # Pool of workers to assign (FIFO — same logic as Node.js orchestrator)
     available_workers = [w for w in workers if w.id not in used_worker_ids]
-    available_vehicles_by_id = {v.id: v for v in vehicles}
 
     newly_used_vehicle_ids: set[str] = set()
     newly_used_worker_ids:  set[str] = set()
@@ -214,7 +226,8 @@ def _optimize_pass(
                 ))
             continue
 
-        veh_input   = vehicles[assignment.vehicle_idx]
+        # Resolve VehicleInput from the GA's sorted vehicle index
+        veh_input = ga_veh_idx_to_input.get(assignment.vehicle_idx, vehicles[0])
         worker      = available_workers[0]
         pkg_inputs  = [packages[i] for i in assignment.package_indices]
 
@@ -345,6 +358,15 @@ def _to_ga_packages(packages: list[PackageInput], route_type: str) -> list[Packa
     return result
 
 
+_VEHICLE_TYPE_RANK: dict[str, int] = {
+    "motorcycle":  0,
+    "car":         1,
+    "van":         2,
+    "small_truck": 3,
+    "large_truck": 4,
+}
+
+
 def _to_ga_vehicles(vehicles: list[VehicleInput]) -> list[VehicleGA]:
     return [
         VehicleGA(
@@ -352,6 +374,7 @@ def _to_ga_vehicles(vehicles: list[VehicleInput]) -> list[VehicleGA]:
             max_weight=v.maxWeight,
             max_volume=v.maxVolume,
             supports_fragile=v.supportsFragile,
+            type_rank=_VEHICLE_TYPE_RANK.get(v.type, 2),
         )
         for i, v in enumerate(vehicles)
     ]
