@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    osrm_url = os.getenv("OSRM_URL", "http://router.project-osrm.org")
+    osrm_url = os.getenv("OSRM_URL", "http://localhost:5000")
     logger.info(f"Optimizer starting up — OSRM_URL={osrm_url}")
     yield
     logger.info("Optimizer shutting down")

@@ -421,21 +421,34 @@ def run_genetic_assignment(
 
     # ── Build initial population ───────────────────────────────────────────────
 
-    # Seed A: greedy fill-first using sorted (small→large) vehicle order
+    # Seed A: greedy FFD using sorted (small→large) vehicle order
     seed_a = _greedy_seed(packages, sorted_vehicles, is_deliverer)
 
-    # Seed B: greedy fill using reversed (large→small) vehicle order, then
-    # remapped to sorted indices.  Gives the GA an alternative perspective
-    # where large vehicles are preferred — crossover will mix both strategies.
+    # Seed B: greedy FFD using reversed (large→small) vehicle order.
+    # This is the critical seed for consolidation: it tries to put everything
+    # into the largest vehicle first, which is the correct solution when one
+    # large vehicle can carry the entire load.
     reversed_vehicles = list(reversed(sorted_vehicles))
     seed_b_raw        = _greedy_seed(packages, reversed_vehicles, is_deliverer)
     seed_b            = _remap_seed(seed_b_raw, sorted_vehicles, reversed_vehicles)
 
-    population: list[np.ndarray] = [seed_a, seed_b]
+    # Seed C: pure consolidation — assign every package to the single largest
+    # vehicle that can carry the full load.  If no single vehicle fits,
+    # falls back to the largest vehicle (GA repairs violations from there).
+    # This seed directly represents the "one big truck" optimal solution.
+    seed_c = _consolidation_seed(packages, sorted_vehicles, is_deliverer)
 
-    # Fill rest with biased-random chromosomes (skewed toward smaller indices)
-    for _ in range(POPULATION_SIZE - 2):
-        population.append(_biased_random_chromosome(n_pkg, n_veh))
+    population: list[np.ndarray] = [seed_a, seed_b, seed_c]
+
+    # Fill rest: mix of uniform-random (exploration) and biased-random
+    # (consolidation preference).  We use 50/50 to avoid over-biasing
+    # the population toward small vehicles — the real bug that caused
+    # the consolidation failure.
+    for i in range(POPULATION_SIZE - 3):
+        if i % 2 == 0:
+            population.append(_random_chromosome(n_pkg, n_veh))
+        else:
+            population.append(_biased_random_chromosome(n_pkg, n_veh))
 
     # ── Fitness closure (captures sorted_vehicles + is_deliverer) ──────────────
     def evaluate(chrom: np.ndarray) -> float:
@@ -443,9 +456,11 @@ def run_genetic_assignment(
             chrom, packages, sorted_vehicles, is_deliverer, dist_matrix, origin_coords
         )
 
-    # ── Initialise best tracker ────────────────────────────────────────────────
-    best_chromosome  = seed_a.copy()
-    best_fitness     = evaluate(seed_a)
+    # ── Initialise best tracker — start from best of all 3 seeds ──────────────
+    seed_fitnesses = [(evaluate(s), s) for s in [seed_a, seed_b, seed_c]]
+    seed_fitnesses.sort(key=lambda x: x[0])
+    best_fitness, best_chromosome = seed_fitnesses[0]
+    best_chromosome = best_chromosome.copy()
     stagnation_count = 0
     mutation_rate    = MUTATION_RATE_BASE
     generation       = 0
@@ -577,6 +592,58 @@ def _greedy_seed(
 
     return assignment
 
+
+
+def _consolidation_seed(
+    packages:      list[PackageGA],
+    vehicles:      list[VehicleGA],   # sorted small→large
+    is_deliverer:  bool,
+) -> np.ndarray:
+    """
+    Consolidation seed: assign ALL packages to the single largest vehicle
+    that can carry the full load without violating any hard constraint.
+
+    This directly encodes the "use one big vehicle" optimal solution so the
+    GA starts with it in its population and can inherit it via elitism.
+
+    Logic:
+      1. Try vehicles from largest to smallest (reversed sorted order).
+      2. Pick the first vehicle whose capacity covers all packages at once.
+      3. If no single vehicle fits (load genuinely too large for any one
+         vehicle), fall back to the reversed-order greedy seed which at
+         least prefers large vehicles.
+
+    Why this matters:
+      The fill-score heuristic in _greedy_seed naturally prefers small
+      vehicles because they reach higher fill ratios faster.  For a load
+      that fits entirely in one large truck, the greedy seed spreads it
+      across multiple smaller vehicles instead — a locally optimal but
+      globally suboptimal choice that the GA then fails to escape.
+    """
+    n_veh      = len(vehicles)
+    n_pkgs     = len(packages)
+    total_w    = sum(p.weight for p in packages)
+    total_v    = sum(p.volume for p in packages)
+    has_fragile = any(p.is_fragile for p in packages)
+
+    # Try vehicles largest → smallest
+    for veh_idx in range(n_veh - 1, -1, -1):
+        veh = vehicles[veh_idx]
+        if has_fragile and not veh.supports_fragile:
+            continue
+        if total_w > veh.max_weight * CAPACITY_BUFFER:
+            continue
+        if total_v > veh.max_volume * CAPACITY_BUFFER:
+            continue
+        if is_deliverer and n_pkgs > MAX_PKGS_PER_DELIVERER:
+            # Can't fit all in one deliverer vehicle — skip consolidation
+            continue
+        # Found a vehicle that fits everything
+        return np.full(n_pkgs, veh_idx, dtype=int)
+
+    # No single vehicle fits the full load — assign everything to the largest
+    # vehicle (index n_veh-1) and let the GA repair violations from there.
+    return np.full(n_pkgs, n_veh - 1, dtype=int)
 
 def _remap_seed(
     seed:          np.ndarray,
