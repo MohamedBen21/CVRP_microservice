@@ -33,7 +33,7 @@ from algorithms.genetic_assignment import (
     run_genetic_assignment, CAPACITY_BUFFER,
 )
 from algorithms.routing import StopPoint, optimised_route
-from utils.osrm_client import fetch_distance_matrix
+from utils.osrm_client import GlobalDistanceMatrix
 from utils.haversine import estimated_drive_minutes
 
 logger = logging.getLogger(__name__)
@@ -184,10 +184,52 @@ def _optimize_pass(
         branch_ids = [p.destinationBranchId for p in packages]
         _clusters = cluster_transporter_packages(branch_ids)
 
-    # ── Genetic Algorithm: joint package→vehicle assignment ───────────────────
-    # We run GA on the full package set (not per-cluster) for true joint
-    # optimization.  Clusters are used only to build a smarter greedy seed.
+    # ── OSRM: ONE global matrix call for ALL stop coordinates ─────────────────
+    # Collect every unique stop coordinate for this pass so we can fire a
+    # single OSRM table request covering all of them.  After the GA assigns
+    # packages to vehicles we slice out each vehicle's sub-matrix cheaply
+    # in memory — no further HTTP calls are made.
     #
+    # For transporter packages (coords = None) we use origin as a placeholder;
+    # they contribute 0 to distance estimation anyway.
+    all_stop_coords: list[tuple[float, float]] = []
+    for pkg in packages:
+        if route_type == "local_delivery":
+            c = pkg.destination.coordinates if pkg.destination else origin
+        else:
+            c = origin   # placeholder; real branch coords resolved by Node.js
+        all_stop_coords.append(c)
+
+    global_dm = GlobalDistanceMatrix.build(origin, all_stop_coords)
+
+    # Build a pkg_idx → global_matrix_index lookup so the GA and routing
+    # can look up distances without re-hashing coordinates every time.
+    pkg_coord_to_gidx: dict[int, int] = {}
+    for pkg_i, pkg in enumerate(packages):
+        if route_type == "local_delivery":
+            c = pkg.destination.coordinates if pkg.destination else origin
+        else:
+            c = origin
+        idx = global_dm.index_of(c)
+        if idx is not None:
+            pkg_coord_to_gidx[pkg_i] = idx
+
+    # Build a package-level distance matrix for the GA fitness function.
+    # This is an N×N matrix where N = number of packages.
+    # ga_dist_matrix[i][j] = road distance (km) between package i and j.
+    n_pkgs = len(packages)
+    if global_dm.source == "osrm":
+        ga_dist_matrix: list[list[float]] | None = [
+            [
+                global_dm.matrix[pkg_coord_to_gidx.get(i, 0)][pkg_coord_to_gidx.get(j, 0)]
+                for j in range(n_pkgs)
+            ]
+            for i in range(n_pkgs)
+        ]
+    else:
+        ga_dist_matrix = None   # GA will use Haversine internally
+
+    # ── Genetic Algorithm: joint package→vehicle assignment ───────────────────
     # is_deliverer: enforces the ≤15 packages/vehicle hard constraint and
     # uses the correct penalty scale inside the fitness function.
     is_deliverer = (route_type == "local_delivery")
@@ -196,6 +238,7 @@ def _optimize_pass(
         vehicles=ga_vehicles,
         origin_coords=origin,
         is_deliverer=is_deliverer,
+        dist_matrix=ga_dist_matrix,
     )
 
     # Build a lookup from GA vehicle index → original VehicleInput.
@@ -243,17 +286,37 @@ def _optimize_pass(
         )
 
         if not cap_ok or not pkg_inputs:
-            for p in pkg_inputs:
-                if p.isFragile and not veh_input.supportsFragile:
-                    reason = f"Vehicle {veh_input.registrationNumber} does not support fragile packages"
-                elif total_w > veh_input.maxWeight * CAPACITY_BUFFER:
-                    reason = f"Exceeds vehicle weight capacity ({total_w:.1f}kg > {veh_input.maxWeight * CAPACITY_BUFFER:.1f}kg)"
-                elif total_v > veh_input.maxVolume * CAPACITY_BUFFER:
-                    reason = f"Exceeds vehicle volume capacity ({total_v:.3f}m³ > {veh_input.maxVolume * CAPACITY_BUFFER:.3f}m³)"
-                else:
-                    reason = "No compatible vehicle found after optimization"
-                unscheduled.append(UnscheduledPackage(packageId=p.id, reason=reason))
-            continue
+            # ── Safety net: GA produced a bad assignment for this group ──────
+            # Before giving up, try every remaining vehicle to find one that
+            # can actually carry this load.  This rescues packages that the GA
+            # incorrectly split or assigned to the wrong vehicle — the most
+            # common failure mode being "everything fits in the large truck but
+            # the GA spread it across smaller vehicles instead."
+            rescue_vehicle = _find_rescue_vehicle(
+                vehicles, total_w, total_v, has_fragile,
+                used_ids=newly_used_vehicle_ids
+            )
+            if rescue_vehicle is not None:
+                # Swap the GA-assigned vehicle for the rescue vehicle and
+                # let the route-building continue normally below.
+                veh_input = rescue_vehicle
+                cap_ok    = True
+                logger.info(
+                    f"[pipeline] Rescued {len(pkg_inputs)} packages from bad GA "
+                    f"assignment onto {rescue_vehicle.registrationNumber}"
+                )
+            else:
+                for p in pkg_inputs:
+                    if p.isFragile and not veh_input.supportsFragile:
+                        reason = f"Vehicle {veh_input.registrationNumber} does not support fragile packages"
+                    elif total_w > veh_input.maxWeight * CAPACITY_BUFFER:
+                        reason = f"Exceeds vehicle weight capacity ({total_w:.1f}kg > {veh_input.maxWeight * CAPACITY_BUFFER:.1f}kg)"
+                    elif total_v > veh_input.maxVolume * CAPACITY_BUFFER:
+                        reason = f"Exceeds vehicle volume capacity ({total_v:.3f}m³ > {veh_input.maxVolume * CAPACITY_BUFFER:.3f}m³)"
+                    else:
+                        reason = "No compatible vehicle found after optimization"
+                    unscheduled.append(UnscheduledPackage(packageId=p.id, reason=reason))
+                continue
 
         # ── Build stop points ─────────────────────────────────────────────────
         stops = _build_stops(pkg_inputs, route_type, origin=origin)
@@ -265,22 +328,26 @@ def _optimize_pass(
                 ))
             continue
 
-        # ── Fetch OSRM distance matrix for this vehicle's stops ───────────────
-        all_coords = [origin] + [s.coords for s in stops]
-        matrix, distance_source = fetch_distance_matrix(all_coords)
-
-        # Build stop_index_map for routing (offset by 1 because index 0 = origin)
-        stop_index_map: dict[str, int] = {}
+        # ── Slice sub-matrix for this vehicle from the global matrix ──────────
+        # No HTTP call here — pure in-memory index lookup, takes < 1 ms.
         sub_matrix: list[list[float]] | None = None
+        stop_index_map: dict[str, int] = {}
 
-        if distance_source == "osrm" and matrix:
-            # The matrix covers [origin, stop0, stop1, ...].
-            # For the routing algorithm we only need stop↔stop distances
-            # (stop rows/cols start at index 1 in the full matrix).
+        if global_dm.source == "osrm":
+            # Build an ordered list of global matrix indices for this vehicle:
+            # [origin_idx, stop0_idx, stop1_idx, ...]
+            veh_global_indices = [global_dm.index_of(origin)]
+            for stop in stops:
+                idx = global_dm.index_of(stop.coords)
+                veh_global_indices.append(idx if idx is not None else 0)
+
+            # Slice: sub_matrix[i][j] = global_dm.matrix[veh_global_indices[i]][veh_global_indices[j]]
+            sub_matrix = global_dm.slice(veh_global_indices)
+
+            # Map stop IDs to sub-matrix positions (0 = origin)
             stop_index_map = {"__origin__": 0}
             for si, stop in enumerate(stops):
                 stop_index_map[stop.id] = si + 1
-            sub_matrix = matrix  # full matrix passed; routing uses index_map to slice
 
         # ── Route optimization (nearest-neighbour + 2-opt) ────────────────────
         route_result = optimised_route(
@@ -435,6 +502,38 @@ def _build_stops(packages: list[PackageInput], route_type: str, origin: tuple[fl
         ))
 
     return stops
+
+
+
+def _find_rescue_vehicle(
+    vehicles:     list[VehicleInput],
+    total_w:      float,
+    total_v:      float,
+    has_fragile:  bool,
+    used_ids:     set[str],
+) -> VehicleInput | None:
+    """
+    Safety net: finds the smallest available vehicle that can carry a load
+    (total_w, total_v) when the GA assigned it to the wrong vehicle.
+
+    Searches all vehicles — including ones not yet used this pass — and
+    returns the smallest fitting one to respect the consolidation objective.
+    Vehicles already used this pass (used_ids) are excluded because each
+    vehicle can only be on one route.
+    """
+    candidates = [
+        v for v in vehicles
+        if v.id not in used_ids
+        and (not has_fragile or v.supportsFragile)
+        and total_w <= v.maxWeight * CAPACITY_BUFFER
+        and total_v <= v.maxVolume * CAPACITY_BUFFER
+    ]
+    if not candidates:
+        return None
+    # Pick the smallest fitting vehicle (same preference as the GA)
+    _rank = {"motorcycle": 0, "car": 1, "van": 2, "small_truck": 3, "large_truck": 4}
+    candidates.sort(key=lambda v: (_rank.get(v.type, 2), v.maxWeight))
+    return candidates[0]
 
 
 def _build_stop_output(
