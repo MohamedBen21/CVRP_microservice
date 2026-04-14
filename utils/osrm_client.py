@@ -34,7 +34,7 @@ from utils.haversine import Coords, build_distance_matrix, haversine_km
 
 logger = logging.getLogger(__name__)
 
-OSRM_URL     = os.getenv("OSRM_URL",     "http://router.project-osrm.org")
+OSRM_URL     = os.getenv("OSRM_URL",     "http://localhost:5000")
 OSRM_TIMEOUT = float(os.getenv("OSRM_TIMEOUT", "15"))   # raised from 8 → 15 for safety
 
 

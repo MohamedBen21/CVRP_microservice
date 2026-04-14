@@ -103,8 +103,11 @@ class RouteOutput(BaseModel):
     totalVolume: float
     distanceKm: float
     estimatedTimeMinutes: int
-    # "osrm" or "haversine" — lets Node.js log which provider was used
-    distanceSource: Literal["osrm", "haversine"]
+    # "osrm"      — real road distances from OSRM (deliverer routes)
+    # "haversine" — straight-line fallback (deliverer routes when OSRM unavailable)
+    # "n/a"       — inter-branch routes: distance is 0 because branch coordinates
+    #               are not in the request; Node.js resolves them at persist time
+    distanceSource: Literal["osrm", "haversine", "n/a"]
 
 
 class UnscheduledPackage(BaseModel):

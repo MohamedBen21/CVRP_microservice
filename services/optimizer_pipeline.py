@@ -184,50 +184,52 @@ def _optimize_pass(
         branch_ids = [p.destinationBranchId for p in packages]
         _clusters = cluster_transporter_packages(branch_ids)
 
-    # ── OSRM: ONE global matrix call for ALL stop coordinates ─────────────────
-    # Collect every unique stop coordinate for this pass so we can fire a
-    # single OSRM table request covering all of them.  After the GA assigns
-    # packages to vehicles we slice out each vehicle's sub-matrix cheaply
-    # in memory — no further HTTP calls are made.
+    # ── OSRM: ONE global matrix call per pass (deliverer only) ──────────────
     #
-    # For transporter packages (coords = None) we use origin as a placeholder;
-    # they contribute 0 to distance estimation anyway.
-    all_stop_coords: list[tuple[float, float]] = []
-    for pkg in packages:
-        if route_type == "local_delivery":
-            c = pkg.destination.coordinates if pkg.destination else origin
-        else:
-            c = origin   # placeholder; real branch coords resolved by Node.js
-        all_stop_coords.append(c)
+    # Transporter pass: all packages map to `origin` as a placeholder because
+    # real branch coordinates are not in the request — Node.js fetches them at
+    # persist time.  Calling OSRM with a single deduplicated point is wasteful
+    # and always falls back to Haversine anyway, so we skip it entirely.
+    #
+    # Deliverer pass: collect every unique customer coordinate and build one
+    # matrix covering all stops.  Each vehicle's sub-matrix is sliced cheaply
+    # in memory after the GA assignment — no further HTTP calls are made.
 
-    global_dm = GlobalDistanceMatrix.build(origin, all_stop_coords)
-
-    # Build a pkg_idx → global_matrix_index lookup so the GA and routing
-    # can look up distances without re-hashing coordinates every time.
-    pkg_coord_to_gidx: dict[int, int] = {}
-    for pkg_i, pkg in enumerate(packages):
-        if route_type == "local_delivery":
-            c = pkg.destination.coordinates if pkg.destination else origin
-        else:
-            c = origin
-        idx = global_dm.index_of(c)
-        if idx is not None:
-            pkg_coord_to_gidx[pkg_i] = idx
-
-    # Build a package-level distance matrix for the GA fitness function.
-    # This is an N×N matrix where N = number of packages.
-    # ga_dist_matrix[i][j] = road distance (km) between package i and j.
-    n_pkgs = len(packages)
-    if global_dm.source == "osrm":
-        ga_dist_matrix: list[list[float]] | None = [
-            [
-                global_dm.matrix[pkg_coord_to_gidx.get(i, 0)][pkg_coord_to_gidx.get(j, 0)]
-                for j in range(n_pkgs)
-            ]
-            for i in range(n_pkgs)
+    if route_type == "local_delivery":
+        all_stop_coords: list[tuple[float, float]] = [
+            pkg.destination.coordinates if pkg.destination else origin
+            for pkg in packages
         ]
+        global_dm = GlobalDistanceMatrix.build(origin, all_stop_coords)
+
+        # pkg_idx → global matrix index (for GA fitness function)
+        pkg_coord_to_gidx: dict[int, int] = {}
+        for pkg_i, pkg in enumerate(packages):
+            c = pkg.destination.coordinates if pkg.destination else origin
+            idx = global_dm.index_of(c)
+            if idx is not None:
+                pkg_coord_to_gidx[pkg_i] = idx
+
+        # N×N package-level distance matrix for GA
+        n_pkgs = len(packages)
+        ga_dist_matrix: list[list[float]] | None = (
+            [
+                [
+                    global_dm.matrix[pkg_coord_to_gidx.get(i, 0)][pkg_coord_to_gidx.get(j, 0)]
+                    for j in range(n_pkgs)
+                ]
+                for i in range(n_pkgs)
+            ]
+            if global_dm.source == "osrm"
+            else None
+        )
     else:
-        ga_dist_matrix = None   # GA will use Haversine internally
+        # Transporter pass — no OSRM call, no distance matrix.
+        # GA uses Haversine internally (all coords are origin placeholders,
+        # so all distances are 0 — irrelevant for the fitness function since
+        # transporter packages have no route cost contribution).
+        global_dm    = None
+        ga_dist_matrix = None
 
     # ── Genetic Algorithm: joint package→vehicle assignment ───────────────────
     # is_deliverer: enforces the ≤15 packages/vehicle hard constraint and
@@ -329,11 +331,12 @@ def _optimize_pass(
             continue
 
         # ── Slice sub-matrix for this vehicle from the global matrix ──────────
-        # No HTTP call here — pure in-memory index lookup, takes < 1 ms.
+        # Transporter pass: global_dm is None (no OSRM call was made).
+        # Deliverer pass:   slice in-memory, no HTTP call, < 1 ms.
         sub_matrix: list[list[float]] | None = None
         stop_index_map: dict[str, int] = {}
 
-        if global_dm.source == "osrm":
+        if global_dm is not None and global_dm.source == "osrm":
             # Build an ordered list of global matrix indices for this vehicle:
             # [origin_idx, stop0_idx, stop1_idx, ...]
             veh_global_indices = [global_dm.index_of(origin)]
@@ -370,6 +373,21 @@ def _optimize_pass(
         ]
         all_pkg_ids = [p.id for p in pkg_inputs]
 
+        # Inter-branch distance is always 0.0 — branch coordinates are not in
+        # the request and are resolved by Node.js at persist time.  Label the
+        # source "n/a" so Node.js knows this is a placeholder, not a real
+        # distance calculation.
+        distance_source = (
+            "n/a"
+            if route_type == "inter_branch"
+            else route_result.distance_source
+        )
+        distance_km = (
+            0.0
+            if route_type == "inter_branch"
+            else round(route_result.total_distance_km, 2)
+        )
+
         route = RouteOutput(
             vehicleId=veh_input.id,
             workerId=worker.id,
@@ -378,9 +396,9 @@ def _optimize_pass(
             packageIds=all_pkg_ids,
             totalWeight=round(total_w, 2),
             totalVolume=round(total_v, 4),
-            distanceKm=round(route_result.total_distance_km, 2),
+            distanceKm=distance_km,
             estimatedTimeMinutes=total_time,
-            distanceSource=route_result.distance_source,
+            distanceSource=distance_source,
         )
 
         routes.append(route)
