@@ -373,6 +373,225 @@ def _optimize_hub_to_hub(
 #  PASS 2 IMPLEMENTATION: HUB-TO-BRANCH
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _optimize_hub_to_branch(
+    manifests:        list[ManifestInput],
+    vehicles:         list[VehicleInput],
+    workers:          list[WorkerInput],   # all transporterType == "hub_to_branch"
+    origin:           tuple[float, float],
+    used_vehicle_ids: set[str],
+    used_worker_ids:  set[str],
+) -> tuple[list[RouteOutput], list[UnscheduledManifest], set[str], set[str]]:
+    """
+    Hub-to-branch routing.
+
+    Each hub_to_branch worker has `assignedBranches` = the subset of local
+    branches they serve from the hub.
+
+    Strategy:
+      1. For each worker, filter manifests to only those whose
+         destinationBranchId is in that worker's assignedBranches.
+      2. Among all workers, find the best assignment of manifests to
+         workers+vehicles using a lightweight greedy approach
+         (GA would be overkill here — the load unit is already a manifest,
+         not a package, so there are far fewer items to assign).
+      3. For each worker's manifest set, build an ordered multi-stop route
+         using nearest-neighbour + 2-opt on branch coordinates.
+
+    If a manifest's destination branch is not covered by any worker's
+    assignedBranches, it is marked unscheduled.
+    """
+    routes:      list[RouteOutput]         = []
+    unscheduled: list[UnscheduledManifest] = []
+
+    newly_used_vehicle_ids: set[str] = set()
+    newly_used_worker_ids:  set[str] = set()
+
+    available_workers  = [w for w in workers if w.id not in used_worker_ids]
+    available_vehicles = [v for v in vehicles if v.id not in used_vehicle_ids]
+
+    if not available_workers or not available_vehicles:
+        for m in manifests:
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason="No hub_to_branch workers or vehicles available",
+            ))
+        return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
+
+    # Build a reverse index: branchId → workers who serve it
+    branch_to_workers: dict[str, list[WorkerInput]] = {}
+    for w in available_workers:
+        for branch_id in (w.assignedBranches or []):
+            branch_to_workers.setdefault(branch_id, []).append(w)
+
+    # Check coverage: mark manifests whose destination has no covering worker
+    covered_manifests:   list[ManifestInput] = []
+    for m in manifests:
+        if m.destinationBranchId in branch_to_workers:
+            covered_manifests.append(m)
+        else:
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason=f"No hub_to_branch worker covers branch {m.destinationBranchId}",
+            ))
+
+    if not covered_manifests:
+        return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
+
+    # ── Greedy manifest→worker assignment ────────────────────────────────────
+    # Build a per-worker manifest list: each manifest goes to the worker whose
+    # assignedBranches contains its destination AND who has the most remaining
+    # capacity (greedy fill-first to minimise vehicles used).
+
+    worker_manifest_map: dict[str, list[ManifestInput]] = {
+        w.id: [] for w in available_workers
+    }
+    worker_weight_used:  dict[str, float] = {w.id: 0.0 for w in available_workers}
+    worker_volume_used:  dict[str, float] = {w.id: 0.0 for w in available_workers}
+
+    # Pick a vehicle per worker (tentative; we re-check capacity later)
+    worker_vehicle: dict[str, VehicleInput | None] = {w.id: None for w in available_workers}
+    remaining_vehicles = list(available_vehicles)
+
+    for w in available_workers:
+        veh = _pick_vehicle_for_worker(remaining_vehicles, newly_used_vehicle_ids)
+        if veh:
+            worker_vehicle[w.id] = veh
+            remaining_vehicles = [v for v in remaining_vehicles if v.id != veh.id]
+
+    # Sort manifests: heaviest first
+    covered_manifests.sort(key=lambda m: -m.totalWeight)
+
+    for m in covered_manifests:
+        dest = m.destinationBranchId
+        candidate_workers = [
+            w for w in available_workers
+            if dest in (w.assignedBranches or [])
+            and worker_vehicle.get(w.id) is not None
+        ]
+        if not candidate_workers:
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason=f"No worker with vehicle available for branch {dest}",
+            ))
+            continue
+
+        # Pick worker with highest remaining capacity (weight-based tiebreak)
+        def remaining_cap(w: WorkerInput) -> float:
+            veh = worker_vehicle[w.id]
+            return veh.maxWeight * CAPACITY_BUFFER - worker_weight_used[w.id]
+
+        candidate_workers.sort(key=remaining_cap, reverse=True)
+        assigned = False
+        for w in candidate_workers:
+            veh = worker_vehicle[w.id]
+            new_w = worker_weight_used[w.id] + m.totalWeight
+            new_v = worker_volume_used[w.id] + m.totalVolume
+            if (
+                new_w <= veh.maxWeight * CAPACITY_BUFFER
+                and new_v <= veh.maxVolume * CAPACITY_BUFFER
+            ):
+                worker_manifest_map[w.id].append(m)
+                worker_weight_used[w.id] = new_w
+                worker_volume_used[w.id] = new_v
+                assigned = True
+                break
+
+        if not assigned:
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason="Capacity exceeded on all workers that serve this branch",
+            ))
+
+    # ── Build routes for each worker ─────────────────────────────────────────
+    for worker in available_workers:
+        worker_manifests = worker_manifest_map.get(worker.id, [])
+        if not worker_manifests:
+            continue  # nothing assigned to this worker
+
+        veh = worker_vehicle.get(worker.id)
+        if veh is None:
+            for m in worker_manifests:
+                unscheduled.append(UnscheduledManifest(
+                    manifestId=m.id, reason="No vehicle assigned to worker"
+                ))
+            continue
+
+        # Build stop points: one stop per destination branch
+        stops = _build_manifest_stops(worker_manifests)
+
+        # Build OSRM or Haversine distance matrix for stop ordering
+        all_stop_coords = [s.coords for s in stops]
+        global_dm = GlobalDistanceMatrix.build(origin, all_stop_coords)
+
+        stop_index_map: dict[str, int] = {}
+        sub_matrix: list[list[float]] | None = None
+        if global_dm.source == "osrm":
+            veh_global_indices = [global_dm.index_of(origin)]
+            for stop in stops:
+                idx = global_dm.index_of(stop.coords)
+                veh_global_indices.append(idx if idx is not None else 0)
+            sub_matrix = global_dm.slice(veh_global_indices)
+            stop_index_map = {"__origin__": 0}
+            for si, stop in enumerate(stops):
+                stop_index_map[stop.id] = si + 1
+
+        route_result = optimised_route(
+            origin=origin,
+            stops=stops,
+            route_type="inter_branch",
+            dist_matrix=sub_matrix,
+            stop_index_map=stop_index_map if sub_matrix else None,
+        )
+
+        total_drive = sum(route_result.segment_drive_minutes)
+        total_dwell = len(stops) * HUB_BRANCH_DWELL
+        total_time  = total_drive + total_dwell
+
+        # Build StopOutput list (ordered by the optimised route)
+        stop_outputs: list[StopOutput] = []
+        manifest_by_stop: dict[str, list[ManifestInput]] = {}
+        for m in worker_manifests:
+            manifest_by_stop.setdefault(m.destinationBranchId, []).append(m)
+
+        for stop_pt in route_result.ordered_stops:
+            branch_id = stop_pt.meta.get("destinationBranchId", stop_pt.id)
+            manifests_at_stop = manifest_by_stop.get(branch_id, [])
+            stop_outputs.append(StopOutput(
+                coordinates=stop_pt.coords,
+                manifestIds=[m.id for m in manifests_at_stop],
+                destinationBranchId=branch_id,
+            ))
+
+        distance_km = round(route_result.total_distance_km, 2) if global_dm.source != "n/a" else 0.0
+        distance_source = route_result.distance_source if global_dm.source != "n/a" else "n/a"
+
+        route = RouteOutput(
+            vehicleId=veh.id,
+            workerId=worker.id,
+            routeType="hub_to_branch",
+            stops=stop_outputs,
+            packageIds=[],
+            manifestIds=[m.id for m in worker_manifests],
+            totalWeight=round(worker_weight_used[worker.id], 2),
+            totalVolume=round(worker_volume_used[worker.id], 4),
+            distanceKm=distance_km,
+            estimatedTimeMinutes=total_time,
+            distanceSource=distance_source,
+        )
+        routes.append(route)
+
+        newly_used_vehicle_ids.add(veh.id)
+        newly_used_worker_ids.add(worker.id)
+
+        logger.debug(
+            f"[pipeline] [hub_to_branch] vehicle={veh.registrationNumber} "
+            f"worker={worker.id} manifests={len(worker_manifests)} "
+            f"stops={len(stops)} dist={route_result.total_distance_km:.1f}km "
+            f"time={total_time}min"
+        )
+
+    return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PASS 3/4 SHARED IMPLEMENTATION: LEGACY TRANSPORTER + DELIVERER
