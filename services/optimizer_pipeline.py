@@ -232,6 +232,141 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
 #  PASS 1 IMPLEMENTATION: HUB-TO-HUB
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _optimize_hub_to_hub(
+    manifests:        list[ManifestInput],
+    vehicles:         list[VehicleInput],
+    workers:          list[WorkerInput],   # all transporterType == "hub_to_hub"
+    origin:           tuple[float, float],
+    used_vehicle_ids: set[str],
+    used_worker_ids:  set[str],
+) -> tuple[list[RouteOutput], list[UnscheduledManifest], set[str], set[str]]:
+    """
+    Hub-to-hub routing.
+
+    Logic:
+      Each worker has an assignedLine = [hubAId, hubBId].
+      We group manifests by destinationBranchId.  For each destination hub
+      that has a waiting worker+vehicle, we create a direct 2-stop route
+      (origin → destination hub, distance resolved at persist time by Node.js).
+
+    If multiple workers serve the same line, we split the manifests across
+    them using a greedy bin-packing approach (heaviest manifests first).
+    """
+    routes:     list[RouteOutput]         = []
+    unscheduled: list[UnscheduledManifest] = []
+
+    newly_used_vehicle_ids: set[str] = set()
+    newly_used_worker_ids:  set[str] = set()
+
+    available_workers  = [w for w in workers if w.id not in used_worker_ids]
+    available_vehicles = [v for v in vehicles if v.id not in used_vehicle_ids]
+
+    if not available_workers or not available_vehicles:
+        for m in manifests:
+            unscheduled.append(
+                UnscheduledManifest(
+                    manifestId=m.id,
+                    reason="No hub_to_hub workers or vehicles available",
+                )
+            )
+        return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
+
+    # Group manifests by destination hub
+    by_dest: dict[str, list[ManifestInput]] = {}
+    for m in manifests:
+        by_dest.setdefault(m.destinationBranchId, []).append(m)
+
+    for dest_hub_id, dest_manifests in by_dest.items():
+        # Find workers whose line includes this destination
+        line_workers = [
+            w for w in available_workers
+            if w.assignedLine and dest_hub_id in w.assignedLine
+            and w.id not in newly_used_worker_ids
+        ]
+        if not line_workers:
+            for m in dest_manifests:
+                unscheduled.append(UnscheduledManifest(
+                    manifestId=m.id,
+                    reason=f"No hub_to_hub worker assigned to line for hub {dest_hub_id}",
+                ))
+            continue
+
+        # Sort manifests: heaviest first (greedy bin-pack)
+        dest_manifests_sorted = sorted(dest_manifests, key=lambda m: -m.totalWeight)
+
+        for worker in line_workers:
+            if not dest_manifests_sorted:
+                break
+
+            veh = _pick_vehicle(available_vehicles, dest_manifests_sorted, newly_used_vehicle_ids)
+            if veh is None:
+                # No vehicle can carry remaining manifests — mark as unscheduled
+                for m in dest_manifests_sorted:
+                    unscheduled.append(UnscheduledManifest(
+                        manifestId=m.id,
+                        reason="No vehicle with sufficient capacity for hub-to-hub leg",
+                    ))
+                dest_manifests_sorted = []
+                break
+
+            # Determine how many manifests fit in this vehicle (greedy)
+            batch: list[ManifestInput] = []
+            running_w = 0.0
+            running_v = 0.0
+            leftover:  list[ManifestInput] = []
+
+            for m in dest_manifests_sorted:
+                if (
+                    running_w + m.totalWeight <= veh.maxWeight * CAPACITY_BUFFER
+                    and running_v + m.totalVolume <= veh.maxVolume * CAPACITY_BUFFER
+                ):
+                    batch.append(m)
+                    running_w += m.totalWeight
+                    running_v += m.totalVolume
+                else:
+                    leftover.append(m)
+
+            dest_manifests_sorted = leftover
+
+            if not batch:
+                continue
+
+            # Build single-stop route: destination hub
+            dest_coords = batch[0].destinationCoordinates  # all manifests go to same hub
+            stop = StopOutput(
+                coordinates=dest_coords,
+                manifestIds=[m.id for m in batch],
+                destinationBranchId=dest_hub_id,
+            )
+
+            # Distance is NOT computed here — Node.js resolves real road distance
+            # from hub to hub at persist time (same pattern as old inter_branch).
+            route = RouteOutput(
+                vehicleId=veh.id,
+                workerId=worker.id,
+                routeType="hub_to_hub",
+                stops=[stop],
+                packageIds=[],
+                manifestIds=[m.id for m in batch],
+                totalWeight=round(running_w, 2),
+                totalVolume=round(running_v, 4),
+                distanceKm=0.0,
+                estimatedTimeMinutes=HUB_HUB_DWELL,
+                distanceSource="n/a",
+            )
+            routes.append(route)
+
+            newly_used_vehicle_ids.add(veh.id)
+            newly_used_worker_ids.add(worker.id)
+
+        # Any remaining manifests after exhausting available workers
+        for m in dest_manifests_sorted:
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason=f"Not enough hub_to_hub workers for hub {dest_hub_id}",
+            ))
+
+    return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
