@@ -63,6 +63,169 @@ HUB_HUB_DWELL     = 30   # time to hand off manifests at destination hub
 #  MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
+    origin = req.branch.coordinates  # [lng, lat]
+
+    # ── Segment workers by role + sub-type ────────────────────────────────────
+    hub_to_hub_workers    = [
+        w for w in req.workers
+        if w.role == "transporter" and w.transporterType == "hub_to_hub"
+    ]
+    hub_to_branch_workers = [
+        w for w in req.workers
+        if w.role == "transporter" and w.transporterType == "hub_to_branch"
+    ]
+    legacy_transporters   = [
+        w for w in req.workers
+        if w.role == "transporter" and not w.transporterType
+    ]
+    deliverers            = [w for w in req.workers if w.role == "deliverer"]
+
+    # ── Segment load ──────────────────────────────────────────────────────────
+    # hub_to_hub manifests: those whose destinationBranchId is one of the line's
+    # two hub IDs.  We let Node.js mark these; we just route all manifests
+    # here — Node.js only sends the ones relevant for each worker category.
+    all_manifests = req.manifests
+
+    # Packages that have no valid destination info
+    unroutable_packages = [
+        p for p in req.packages
+        if not p.destinationBranchId
+        and not (p.deliveryType == "home" and p.destination and p.destination.coordinates)
+    ]
+    deliverer_pkgs = [
+        p for p in req.packages
+        if p.deliveryType == "home"
+        and p.destination is not None
+        and p.destination.coordinates is not None
+    ]
+    legacy_transporter_pkgs = [
+        p for p in req.packages
+        if p.destinationBranchId
+        and p not in deliverer_pkgs
+    ]
+
+    all_routes:               list[RouteOutput]        = []
+    all_unscheduled:          list[UnscheduledPackage]  = []
+    all_unscheduled_manifests: list[UnscheduledManifest] = []
+
+    used_vehicle_ids: set[str] = set()
+    used_worker_ids:  set[str] = set()
+
+    # Mark unroutable packages up front
+    for p in unroutable_packages:
+        all_unscheduled.append(
+            UnscheduledPackage(packageId=p.id, reason="Missing destination coordinates")
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PASS 1 — HUB-TO-HUB
+    # ─────────────────────────────────────────────────────────────────────────
+    if all_manifests and hub_to_hub_workers:
+        available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
+        h2h_routes, h2h_unscheduled, h2h_used_v, h2h_used_w = _optimize_hub_to_hub(
+            manifests=all_manifests,
+            vehicles=available_vehicles,
+            workers=hub_to_hub_workers,
+            origin=origin,
+            used_vehicle_ids=used_vehicle_ids,
+            used_worker_ids=used_worker_ids,
+        )
+        all_routes.extend(h2h_routes)
+        all_unscheduled_manifests.extend(h2h_unscheduled)
+        used_vehicle_ids.update(h2h_used_v)
+        used_worker_ids.update(h2h_used_w)
+    elif all_manifests and not hub_to_hub_workers and not hub_to_branch_workers and not legacy_transporters:
+        for m in all_manifests:
+            all_unscheduled_manifests.append(
+                UnscheduledManifest(manifestId=m.id, reason="No transporter workers available")
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PASS 2 — HUB-TO-BRANCH (manifests → local branches)
+    # ─────────────────────────────────────────────────────────────────────────
+    if all_manifests and hub_to_branch_workers:
+        available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
+        h2b_routes, h2b_unscheduled, h2b_used_v, h2b_used_w = _optimize_hub_to_branch(
+            manifests=all_manifests,
+            vehicles=available_vehicles,
+            workers=hub_to_branch_workers,
+            origin=origin,
+            used_vehicle_ids=used_vehicle_ids,
+            used_worker_ids=used_worker_ids,
+        )
+        all_routes.extend(h2b_routes)
+        all_unscheduled_manifests.extend(h2b_unscheduled)
+        used_vehicle_ids.update(h2b_used_v)
+        used_worker_ids.update(h2b_used_w)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PASS 3 — LEGACY TRANSPORTER (raw packages, inter_branch)
+    #  Retained for backward compatibility with branches not yet on hub model.
+    # ─────────────────────────────────────────────────────────────────────────
+    if legacy_transporter_pkgs and legacy_transporters:
+        available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
+        t_routes, t_unscheduled, t_used_v, t_used_w = _optimize_pass(
+            packages=legacy_transporter_pkgs,
+            vehicles=available_vehicles,
+            workers=legacy_transporters,
+            origin=origin,
+            route_type="inter_branch",
+            dwell_minutes=HUB_BRANCH_DWELL,
+            used_vehicle_ids=used_vehicle_ids,
+            used_worker_ids=used_worker_ids,
+        )
+        all_routes.extend(t_routes)
+        all_unscheduled.extend(t_unscheduled)
+        used_vehicle_ids.update(t_used_v)
+        used_worker_ids.update(t_used_w)
+    elif legacy_transporter_pkgs:
+        for p in legacy_transporter_pkgs:
+            all_unscheduled.append(
+                UnscheduledPackage(packageId=p.id, reason="No legacy transporters available")
+            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  PASS 4 — DELIVERER (packages → customer addresses)
+    # ─────────────────────────────────────────────────────────────────────────
+    if deliverer_pkgs and deliverers:
+        available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
+        d_routes, d_unscheduled, d_used_v, d_used_w = _optimize_pass(
+            packages=deliverer_pkgs,
+            vehicles=available_vehicles,
+            workers=deliverers,
+            origin=origin,
+            route_type="local_delivery",
+            dwell_minutes=DELIVERER_DWELL,
+            used_vehicle_ids=used_vehicle_ids,
+            used_worker_ids=used_worker_ids,
+        )
+        all_routes.extend(d_routes)
+        all_unscheduled.extend(d_unscheduled)
+        used_vehicle_ids.update(d_used_v)
+        used_worker_ids.update(d_used_w)
+    elif deliverer_pkgs:
+        for p in deliverer_pkgs:
+            reason = (
+                "No deliverers available" if not deliverers
+                else "No vehicles available"
+            )
+            all_unscheduled.append(UnscheduledPackage(packageId=p.id, reason=reason))
+
+    return OptimizeResponse(
+        routes=all_routes,
+        unscheduled=all_unscheduled,
+        unscheduledManifests=all_unscheduled_manifests,
+        meta={
+            "totalPackages":         len(req.packages),
+            "totalManifests":        len(req.manifests),
+            "scheduledPackages":     sum(len(r.packageIds) for r in all_routes),
+            "scheduledManifests":    sum(len(r.manifestIds) for r in all_routes),
+            "unscheduledPackages":   len(all_unscheduled),
+            "unscheduledManifests":  len(all_unscheduled_manifests),
+            "routesCreated":         len(all_routes),
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
