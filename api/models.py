@@ -67,14 +67,12 @@ class PackageInput(BaseModel):
 
 
 class ManifestInput(BaseModel):
-
     """
     A sealed manifest bag carried by a transporter.
     This is the load unit for hub-model transporter routes — the optimizer
     treats each manifest the same way it used to treat a single package,
     but the weight/volume are the aggregate of all packages inside the bag.
     """
-
     id: str = Field(..., alias="_id")
     manifestCode: str
 
@@ -83,6 +81,11 @@ class ManifestInput(BaseModel):
     packageCount: int            # number of packages (informational)
     # Volume is optional; use 0.0 when not tracked at manifest level
     totalVolume: float = 0.0     # m³
+
+    # Where this manifest originates from (its current location)
+    originBranchId: str
+    # Coordinates of the origin branch (resolved by Node.js before the call)
+    originCoordinates: Coords
 
     # Where this manifest needs to be delivered / dropped off
     destinationBranchId: str
@@ -125,7 +128,6 @@ class WorkerInput(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-
     """
     Full payload sent by Node.js orchestrator for one hub/branch.
 
@@ -138,7 +140,6 @@ class OptimizeRequest(BaseModel):
     Python separates the three workloads internally and runs independent
     optimization passes for each.
     """
-
     branch: BranchInput
     vehicles: list[VehicleInput]
     workers: list[WorkerInput]
@@ -153,7 +154,6 @@ class OptimizeRequest(BaseModel):
 # ── Output models ─────────────────────────────────────────────────────────────
 
 class StopOutput(BaseModel):
-    
     coordinates: Coords
     packageIds: list[str] = Field(default_factory=list)
 
@@ -172,6 +172,10 @@ class RouteOutput(BaseModel):
     workerId: str
     routeType: Literal["hub_to_hub", "hub_to_branch", "local_delivery"]
     stops: list[StopOutput]
+    # For hub_to_hub routes: which hub this leg departs from.
+    # Node.js uses this to set originBranchId correctly on the persisted route
+    # (critical for return legs which originate at hub B, not hub A).
+    originBranchId: Optional[str] = None
 
     # For package-based routes (deliverer / legacy transporter)
     packageIds: list[str] = Field(default_factory=list)

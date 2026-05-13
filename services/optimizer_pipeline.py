@@ -241,18 +241,37 @@ def _optimize_hub_to_hub(
     used_worker_ids:  set[str],
 ) -> tuple[list[RouteOutput], list[UnscheduledManifest], set[str], set[str]]:
     """
-    Hub-to-hub routing.
+    Hub-to-hub routing — same-night round-trip support.
 
-    Logic:
-      Each worker has an assignedLine = [hubAId, hubBId].
-      We group manifests by destinationBranchId.  For each destination hub
-      that has a waiting worker+vehicle, we create a direct 2-stop route
-      (origin → destination hub, distance resolved at persist time by Node.js).
+    The manifest list contains BOTH outbound and return manifests:
+      • Outbound: originBranchId == planning hub (hub A),  destination == hub B
+      • Return:   originBranchId == partner hub  (hub B),  destination == hub A
 
-    If multiple workers serve the same line, we split the manifests across
-    them using a greedy bin-packing approach (heaviest manifests first).
+    Strategy
+    ────────
+    1. Group manifests by (originBranchId, destinationBranchId) — each unique
+       pair is one leg.
+    2. For each leg, find workers whose assignedLine covers that origin→destination
+       pair and who are NOT yet used.
+    3. Pair outbound + return legs to the SAME worker when possible so T1 gets
+       both legs in one planning run:
+         - Assign T1 to the outbound leg  (hub A → hub B).
+         - Reserve T1 for the return leg  (hub B → hub A).
+       This means T1 arrives at hub B, drops outbound manifests, picks up the
+       pre-built return route immediately — no waiting for the next nightly run.
+    4. If there are no return manifests, the outbound route is still created
+       normally and T1 stays at hub B until return manifests accumulate.
+    5. If return manifests exist but there is no worker to cover them (e.g. a
+       one-way line), they are marked unscheduled.
+
+    Vehicle assignment
+    ──────────────────
+    Each leg gets its own vehicle entry in the route output so Node.js can
+    persist two separate RouteModel documents (one per leg).  In practice T1
+    drives the same physical truck both ways, but the route documents are
+    independent for clean status tracking.
     """
-    routes:     list[RouteOutput]         = []
+    routes:      list[RouteOutput]         = []
     unscheduled: list[UnscheduledManifest] = []
 
     newly_used_vehicle_ids: set[str] = set()
@@ -263,59 +282,100 @@ def _optimize_hub_to_hub(
 
     if not available_workers or not available_vehicles:
         for m in manifests:
-            unscheduled.append(
-                UnscheduledManifest(
-                    manifestId=m.id,
-                    reason="No hub_to_hub workers or vehicles available",
-                )
-            )
+            unscheduled.append(UnscheduledManifest(
+                manifestId=m.id,
+                reason="No hub_to_hub workers or vehicles available",
+            ))
         return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
 
-    # Group manifests by destination hub
-    by_dest: dict[str, list[ManifestInput]] = {}
+    # ── Step 1: group manifests by (origin, destination) leg ─────────────────
+    # key = (originBranchId, destinationBranchId)
+    by_leg: dict[tuple[str, str], list[ManifestInput]] = {}
     for m in manifests:
-        by_dest.setdefault(m.destinationBranchId, []).append(m)
+        key = (m.originBranchId, m.destinationBranchId)
+        by_leg.setdefault(key, []).append(m)
 
-    for dest_hub_id, dest_manifests in by_dest.items():
-        # Find workers whose line includes this destination
-        line_workers = [
+    # ── Step 2: identify line pairs so we can do same-night pairing ───────────
+    # A "line pair" is two legs that are the reverse of each other:
+    #   leg (A→B) and leg (B→A) belong to the same line.
+    # We process legs in outbound-first order (the leg whose origin == the
+    # planning hub origin coordinate comes first) so the outbound worker is
+    # chosen first and then reserved for the return.
+
+    # Sort legs: outbound first (origin matches the planning-hub origin coords)
+    def is_outbound(leg: tuple[str, str]) -> bool:
+        """True if this leg departs from the current planning hub."""
+        leg_manifests = by_leg[leg]
+        if not leg_manifests:
+            return False
+        # Outbound manifests have originCoordinates ≈ the planning hub origin
+        sample = leg_manifests[0]
+        return (
+            abs(sample.originCoordinates[0] - origin[0]) < 0.001
+            and abs(sample.originCoordinates[1] - origin[1]) < 0.001
+        )
+
+    outbound_legs = [leg for leg in by_leg if is_outbound(leg)]
+    return_legs   = [leg for leg in by_leg if not is_outbound(leg)]
+
+    # ── Step 3: process outbound legs first, then return legs ────────────────
+    # For each outbound leg we try to reserve the same worker for the return.
+    reserved_for_return: dict[str, str] = {}  # worker_id → return_leg key (str)
+
+    def _process_leg(
+        origin_id:  str,
+        dest_id:    str,
+        leg_manifests: list[ManifestInput],
+        preferred_worker_id: str | None = None,
+    ) -> None:
+        """Assigns manifests for one leg to workers+vehicles, creating RouteOutput(s)."""
+        nonlocal routes, unscheduled
+
+        if not leg_manifests:
+            return
+
+        # Workers eligible for this leg: assignedLine must contain BOTH hubs
+        eligible = [
             w for w in available_workers
-            if w.assignedLine and dest_hub_id in w.assignedLine
+            if w.assignedLine
+            and origin_id in w.assignedLine
+            and dest_id   in w.assignedLine
             and w.id not in newly_used_worker_ids
         ]
-        if not line_workers:
-            for m in dest_manifests:
+        if not eligible:
+            for m in leg_manifests:
                 unscheduled.append(UnscheduledManifest(
                     manifestId=m.id,
-                    reason=f"No hub_to_hub worker assigned to line for hub {dest_hub_id}",
+                    reason=f"No hub_to_hub worker for leg {origin_id} → {dest_id}",
                 ))
-            continue
+            return
 
-        # Sort manifests: heaviest first (greedy bin-pack)
-        dest_manifests_sorted = sorted(dest_manifests, key=lambda m: -m.totalWeight)
+        # If a preferred worker was reserved for this return leg, put them first
+        if preferred_worker_id:
+            eligible.sort(key=lambda w: 0 if w.id == preferred_worker_id else 1)
 
-        for worker in line_workers:
-            if not dest_manifests_sorted:
+        sorted_manifests = sorted(leg_manifests, key=lambda m: -m.totalWeight)
+
+        for worker in eligible:
+            if not sorted_manifests:
                 break
 
-            veh = _pick_vehicle(available_vehicles, dest_manifests_sorted, newly_used_vehicle_ids)
+            veh = _pick_vehicle(available_vehicles, sorted_manifests, newly_used_vehicle_ids)
             if veh is None:
-                # No vehicle can carry remaining manifests — mark as unscheduled
-                for m in dest_manifests_sorted:
+                for m in sorted_manifests:
                     unscheduled.append(UnscheduledManifest(
                         manifestId=m.id,
                         reason="No vehicle with sufficient capacity for hub-to-hub leg",
                     ))
-                dest_manifests_sorted = []
+                sorted_manifests = []
                 break
 
-            # Determine how many manifests fit in this vehicle (greedy)
-            batch: list[ManifestInput] = []
+            batch:    list[ManifestInput] = []
+            leftover: list[ManifestInput] = []
             running_w = 0.0
             running_v = 0.0
-            leftover:  list[ManifestInput] = []
 
-            for m in dest_manifests_sorted:
+            for m in sorted_manifests:
                 if (
                     running_w + m.totalWeight <= veh.maxWeight * CAPACITY_BUFFER
                     and running_v + m.totalVolume <= veh.maxVolume * CAPACITY_BUFFER
@@ -326,21 +386,20 @@ def _optimize_hub_to_hub(
                 else:
                     leftover.append(m)
 
-            dest_manifests_sorted = leftover
+            sorted_manifests = leftover
 
             if not batch:
                 continue
 
-            # Build single-stop route: destination hub
-            dest_coords = batch[0].destinationCoordinates  # all manifests go to same hub
+            dest_coords   = batch[0].destinationCoordinates
+            origin_coords = batch[0].originCoordinates
+
             stop = StopOutput(
                 coordinates=dest_coords,
                 manifestIds=[m.id for m in batch],
-                destinationBranchId=dest_hub_id,
+                destinationBranchId=dest_id,
             )
 
-            # Distance is NOT computed here — Node.js resolves real road distance
-            # from hub to hub at persist time (same pattern as old inter_branch).
             route = RouteOutput(
                 vehicleId=veh.id,
                 workerId=worker.id,
@@ -353,18 +412,48 @@ def _optimize_hub_to_hub(
                 distanceKm=0.0,
                 estimatedTimeMinutes=HUB_HUB_DWELL,
                 distanceSource="n/a",
+                # Tell Node.js which hub this leg departs from so it can set
+                # originBranchId correctly on the persisted RouteModel document.
+                originBranchId=origin_id,
             )
             routes.append(route)
 
             newly_used_vehicle_ids.add(veh.id)
             newly_used_worker_ids.add(worker.id)
 
-        # Any remaining manifests after exhausting available workers
-        for m in dest_manifests_sorted:
+        for m in sorted_manifests:
             unscheduled.append(UnscheduledManifest(
                 manifestId=m.id,
-                reason=f"Not enough hub_to_hub workers for hub {dest_hub_id}",
+                reason=f"Not enough workers for leg {origin_id} → {dest_id}",
             ))
+
+    # Process outbound legs and reserve workers for their paired return leg
+    for (orig, dest) in outbound_legs:
+        _process_leg(orig, dest, by_leg[(orig, dest)])
+
+        # Find which worker was just assigned to this outbound leg
+        # (the last worker added to newly_used_worker_ids for this leg)
+        reverse_key = (dest, orig)
+        if reverse_key in by_leg:
+            # The worker assigned to the outbound is now in newly_used_worker_ids.
+            # We want them to ALSO handle the return.  Remove them temporarily
+            # from the used set so _process_leg can pick them for the return.
+            # We identify them as the worker whose route was just appended.
+            if routes:
+                last_worker_id = routes[-1].workerId
+                # Temporarily free this worker for the return leg only
+                newly_used_worker_ids.discard(last_worker_id)
+                _process_leg(dest, orig, by_leg[reverse_key],
+                             preferred_worker_id=last_worker_id)
+                # Re-mark as used after both legs are assigned
+                newly_used_worker_ids.add(last_worker_id)
+                # Remove the return leg so it is not processed again below
+                del by_leg[reverse_key]
+
+    # Process any remaining return-only legs (no paired outbound this run)
+    for (orig, dest) in return_legs:
+        if (orig, dest) in by_leg:   # may have been deleted above
+            _process_leg(orig, dest, by_leg[(orig, dest)])
 
     return routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids
 
