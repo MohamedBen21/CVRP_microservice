@@ -81,11 +81,19 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
     ]
     deliverers            = [w for w in req.workers if w.role == "deliverer"]
 
-    # ── Segment load ──────────────────────────────────────────────────────────
-    # hub_to_hub manifests: those whose destinationBranchId is one of the line's
-    # two hub IDs.  We let Node.js mark these; we just route all manifests
-    # here — Node.js only sends the ones relevant for each worker category.
-    all_manifests = req.manifests
+    # ── Segment manifests by worker type ────────────────────────────────────
+    # Collect every hub ID that any hub_to_hub worker services.
+    # Manifests whose destinationBranchId is one of these IDs belong to the
+    # hub_to_hub pass.  All other manifests belong to the hub_to_branch pass.
+    # This prevents the same manifest from being processed by both passes and
+    # avoids inflated unscheduled counts.
+    h2h_hub_ids: set[str] = set()
+    for w in hub_to_hub_workers:
+        for hub_id in (w.assignedLine or []):
+            h2h_hub_ids.add(hub_id)
+
+    h2h_manifests = [m for m in req.manifests if m.destinationBranchId in h2h_hub_ids]
+    h2b_manifests = [m for m in req.manifests if m.destinationBranchId not in h2h_hub_ids]
 
     # Packages that have no valid destination info
     unroutable_packages = [
@@ -119,12 +127,12 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  PASS 1 — HUB-TO-HUB
+    #  PASS 1 — HUB-TO-HUB  (only h2h_manifests — hub-destined bags)
     # ─────────────────────────────────────────────────────────────────────────
-    if all_manifests and hub_to_hub_workers:
+    if h2h_manifests and hub_to_hub_workers:
         available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
         h2h_routes, h2h_unscheduled, h2h_used_v, h2h_used_w = _optimize_hub_to_hub(
-            manifests=all_manifests,
+            manifests=h2h_manifests,
             vehicles=available_vehicles,
             workers=hub_to_hub_workers,
             origin=origin,
@@ -135,19 +143,19 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
         all_unscheduled_manifests.extend(h2h_unscheduled)
         used_vehicle_ids.update(h2h_used_v)
         used_worker_ids.update(h2h_used_w)
-    elif all_manifests and not hub_to_hub_workers and not hub_to_branch_workers and not legacy_transporters:
-        for m in all_manifests:
+    elif h2h_manifests and not hub_to_hub_workers:
+        for m in h2h_manifests:
             all_unscheduled_manifests.append(
-                UnscheduledManifest(manifestId=m.id, reason="No transporter workers available")
+                UnscheduledManifest(manifestId=m.id, reason="No hub_to_hub workers available for hub-destined manifests")
             )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  PASS 2 — HUB-TO-BRANCH (manifests → local branches)
+    #  PASS 2 — HUB-TO-BRANCH (only h2b_manifests → local branches)
     # ─────────────────────────────────────────────────────────────────────────
-    if all_manifests and hub_to_branch_workers:
+    if h2b_manifests and hub_to_branch_workers:
         available_vehicles = [v for v in req.vehicles if v.id not in used_vehicle_ids]
         h2b_routes, h2b_unscheduled, h2b_used_v, h2b_used_w = _optimize_hub_to_branch(
-            manifests=all_manifests,
+            manifests=h2b_manifests,
             vehicles=available_vehicles,
             workers=hub_to_branch_workers,
             origin=origin,
@@ -158,6 +166,11 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
         all_unscheduled_manifests.extend(h2b_unscheduled)
         used_vehicle_ids.update(h2b_used_v)
         used_worker_ids.update(h2b_used_w)
+    elif h2b_manifests and not hub_to_branch_workers:
+        for m in h2b_manifests:
+            all_unscheduled_manifests.append(
+                UnscheduledManifest(manifestId=m.id, reason="No hub_to_branch workers available for branch-destined manifests")
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  PASS 3 — LEGACY TRANSPORTER (raw packages, inter_branch)
@@ -219,6 +232,8 @@ def run_optimization(req: OptimizeRequest) -> OptimizeResponse:
         meta={
             "totalPackages":         len(req.packages),
             "totalManifests":        len(req.manifests),
+            "h2hManifests":          len(h2h_manifests),
+            "h2bManifests":          len(h2b_manifests),
             "scheduledPackages":     sum(len(r.packageIds) for r in all_routes),
             "scheduledManifests":    sum(len(r.manifestIds) for r in all_routes),
             "unscheduledPackages":   len(all_unscheduled),
