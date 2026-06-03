@@ -699,7 +699,6 @@ def _optimize_hub_to_branch(
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PASS 3/4 SHARED IMPLEMENTATION: LEGACY TRANSPORTER + DELIVERER
-#  (unchanged from previous version)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _optimize_pass(
@@ -716,6 +715,17 @@ def _optimize_pass(
     Runs the full CVRP pipeline for one worker type (legacy transporter or deliverer).
     Returns (routes, unscheduled, newly_used_vehicle_ids, newly_used_worker_ids).
     """
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FIX: Early return if no vehicles available (prevents K-Means crash)
+    # ─────────────────────────────────────────────────────────────────────────
+    if len(vehicles) == 0:
+        logger.warning(f"[_optimize_pass] No vehicles available for {route_type}")
+        unscheduled = [
+            UnscheduledPackage(packageId=p.id, reason="No vehicles available")
+            for p in packages
+        ]
+        return [], unscheduled, set(), set()
 
     ga_packages = _to_ga_packages(packages, route_type)
     ga_vehicles = _to_ga_vehicles(vehicles)
@@ -995,17 +1005,27 @@ def _build_manifest_stops(manifests: list[ManifestInput]) -> list[StopPoint]:
 
 
 def _to_ga_packages(packages: list[PackageInput], route_type: str) -> list[PackageGA]:
+    """
+    Convert PackageInput to PackageGA for the Genetic Algorithm.
+    
+    FIX: Handle None volume by converting to 0.0 to avoid TypeError in GA.
+    """
     result = []
     for i, p in enumerate(packages):
         coords = (
             p.destination.coordinates if (route_type == "local_delivery" and p.destination)
             else None
         )
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX: Convert None volume to 0.0 (prevents None + float TypeError)
+        # ─────────────────────────────────────────────────────────────────────
+        volume = p.volume if p.volume is not None else 0.0
+        
         result.append(PackageGA(
             idx=i,
             weight=p.weight,
-            volume=p.volume,
-            is_fragile=p.isFragile,
+            volume=volume,
+            is_fragile=p.is_fragile,
             coords=coords,
             priority=PRIORITY_MAP.get(p.deliveryPriority, 2),
         ))

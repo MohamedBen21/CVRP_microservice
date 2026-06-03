@@ -44,11 +44,21 @@ def cluster_deliverer_packages(
 
     Edge cases:
       • 0 packages → []
+      • 0 vehicles → [] (no vehicles available, cannot cluster)
       • packages ≤ n_vehicles → one cluster per package (trivial)
       • scikit-learn convergence warning silenced (we don't need perfect K-Means)
     """
     n = len(coords)
     if n == 0:
+        return []
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FIX: Guard against n_vehicles == 0 (no vehicles available)
+    # Previously this would pass 0 to KMeans(n_clusters=0) and crash with:
+    # "The 'n_clusters' parameter of KMeans must be an int in the range [1, inf). Got 0 instead."
+    # ─────────────────────────────────────────────────────────────────────────
+    if n_vehicles == 0:
+        logger.warning("[clustering] No vehicles available for deliverer clustering - returning empty clusters")
         return []
 
     k = min(n_vehicles, n)
