@@ -20,6 +20,16 @@
 #                   GA + nearest-neighbour + 2-opt still runs, but the unit of
 #                   load is now a manifest (weight = sum of packages inside),
 #                   not an individual package.
+#
+#  Fix (Problem 1 & 4):
+#  ─────────────────────
+#  Added `preferredVehicleId` to WorkerInput.
+#  Node.js sets this to worker.vehicleId (the pre-assigned currentVehicleId
+#  from the DB) when it builds the OptimizerRequest payload.
+#  The Python pipeline reads this field in _lock_preferred_pairings() and
+#  locks the worker to their own vehicle BEFORE the GA runs — the GA only
+#  processes the remaining free workers.  This guarantees that a worker with
+#  a permanently-assigned vehicle always drives that vehicle.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -113,7 +123,8 @@ class WorkerInput(BaseModel):
     userId: str
     role: Literal["transporter", "deliverer"]
 
-    # Hub model extension — optional; omit for legacy transporters / deliverers
+    # ── Hub model extension — optional; omit for legacy transporters / deliverers ──
+
     transporterType: Optional[Literal["hub_to_hub", "hub_to_branch"]] = None
 
     # hub_to_hub: the two hub branch IDs this transporter shuttles between.
@@ -123,6 +134,22 @@ class WorkerInput(BaseModel):
     # hub_to_branch: the branch IDs this transporter serves from their home hub.
     # The optimizer will build stops only for branches present in this list.
     assignedBranches: Optional[list[str]] = None
+
+    # ── Fix (Problem 1 & 4): pre-assigned vehicle pairing ────────────────────
+    # Node.js sets this to the worker's currentVehicleId from the DB when the
+    # worker already has a permanently-assigned vehicle.
+    #
+    # The pipeline's _lock_preferred_pairings() reads this field and locks the
+    # worker to their vehicle before the GA runs.  This means:
+    #   • The GA never reassigns a worker away from their own vehicle.
+    #   • The vehicle is reserved for that worker and excluded from the free pool.
+    #   • If the locked vehicle doesn't have enough capacity for the GA-assigned
+    #     cluster, the pipeline falls back to the next best available vehicle
+    #     (graceful degradation rather than hard failure).
+    #
+    # If preferredVehicleId is None or not in the available vehicles list, the
+    # worker is treated as free and goes through normal GA assignment.
+    preferredVehicleId: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 

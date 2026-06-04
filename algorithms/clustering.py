@@ -2,18 +2,13 @@
 #  algorithms/clustering.py
 #  Geographic clustering of packages before GA assignment.
 #
-#  Why cluster first?
-#    • A GA operating on 200 packages across 10 vehicles has a huge search
-#      space.  Pre-clustering reduces it by ensuring nearby packages are
-#      considered for the same vehicle, which makes GA fitness evals faster
-#      and more stable.
-#    • For transporter packages (branch → branch), clustering is done by
-#      destination branch — packages going to the same branch are trivially
-#      grouped.  No ML needed.
-#    • For deliverer packages (branch → customer homes), we use K-Means
-#      geographic clustering, one cluster per available vehicle.
-#
-#  Output: list of clusters, each cluster = list of package indices.
+#  Fix (Problem 5):
+#  ─────────────────
+#  Added guard clause for n_vehicles == 0 in cluster_deliverer_packages().
+#  K-Means raises ValueError("n_samples=N should be >= n_clusters=0") when
+#  called with n_clusters=0.  If there are no vehicles available for the
+#  deliverer pass, the pipeline should skip clustering entirely and return [],
+#  which tells _optimize_pass() there are no clusters to assign.
 # ─────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -43,8 +38,8 @@ def cluster_deliverer_packages(
     Each cluster index list maps back to the original package list.
 
     Edge cases:
-      • 0 packages → []
-      • 0 vehicles → [] (no vehicles available, cannot cluster)
+      • 0 packages  → []
+      • 0 vehicles  → []  (FIX: guard added — K-Means crashes with n_clusters=0)
       • packages ≤ n_vehicles → one cluster per package (trivial)
       • scikit-learn convergence warning silenced (we don't need perfect K-Means)
     """
@@ -52,13 +47,16 @@ def cluster_deliverer_packages(
     if n == 0:
         return []
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # FIX: Guard against n_vehicles == 0 (no vehicles available)
-    # Previously this would pass 0 to KMeans(n_clusters=0) and crash with:
-    # "The 'n_clusters' parameter of KMeans must be an int in the range [1, inf). Got 0 instead."
-    # ─────────────────────────────────────────────────────────────────────────
+    # Fix (Problem 5): guard against n_vehicles == 0 before calling KMeans.
+    # When the pipeline has no available vehicles for the deliverer pass,
+    # it passes len(vehicles) == 0.  K-Means with n_clusters=0 raises:
+    #   ValueError: n_samples=N should be >= n_clusters=0
+    # Return empty list — _optimize_pass() will mark all packages unscheduled.
     if n_vehicles == 0:
-        logger.warning("[clustering] No vehicles available for deliverer clustering - returning empty clusters")
+        logger.warning(
+            f"[clustering] cluster_deliverer_packages called with n_vehicles=0 "
+            f"and {n} packages — skipping K-Means, returning no clusters"
+        )
         return []
 
     k = min(n_vehicles, n)
